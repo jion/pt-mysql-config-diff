@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysql "github.com/go-sql-driver/mysql"
 	flag "github.com/spf13/pflag"
 	ini "gopkg.in/ini.v1"
 )
@@ -22,47 +22,48 @@ type options struct {
 	compareBase string // First CNF or first MySQL used as comparisson base
 }
 
-type dsnFlag struct {
-	Host     string
-	Port     int
-	User     string
-	Password string
-	Database string
-	Table    string
-	protocol string
-}
-
-type dsnFlags []dsnFlag
+type dsnFlags []string
 
 func (d dsnFlags) String() string {
-	parts := []string{}
-
-	//if d.Host != "" {
-	//	parts = append(parts, "h="+d.Host)
-	//}
-	//if d.Port != 0 {
-	//	parts = append(parts, fmt.Sprintf("P=%d", d.Port))
-	//}
-	//if d.User != "" {
-	//	parts = append(parts, "u="+d.User)
-	//}
-	//if d.Password != "" {
-	//	parts = append(parts, "p="+d.Password)
-	//}
-	//if d.Database != "" {
-	//	parts = append(parts, "D="+d.Database)
-	//}
-	//if d.Table != "" {
-	//	parts = append(parts, "t="+d.Table)
-	//}
-
-	return strings.Join(parts, ",")
+	return strings.Join(d, ",")
 }
 
-func (d dsnFlags) Set(value string) error {
+func (d *dsnFlags) Set(value string) error {
+	newDSN, err := newDsnFlag(value)
+	if err != nil {
+		return err
+	}
+
+	*d = append(*d, newDSN)
+	return nil
+}
+
+func (d dsnFlags) Type() string {
+	return "dsn"
+}
+
+func newDsnFlag(value string) (string, error) {
+	parseTry := func(value string) error {
+		_, err := mysql.ParseDSN(value)
+		return err
+	}
+
+	// First try (arg is mysql dsn formatted)
+	err := parseTry(value)
+	if err == nil {
+		return value, nil
+	}
+
+	// Second try (arg is legacy dsn formatted)
+	dsn := convertFromLegacyDsnFormat(value)
+
+	return dsn, parseTry(dsn)
+}
+
+func convertFromLegacyDsnFormat(value string) string {
 	parts := strings.Split(value, ",")
 
-	var dsn dsnFlag
+	var cfg mysql.Config
 	for _, part := range parts {
 		if len(part) < 3 {
 			continue
@@ -71,34 +72,27 @@ func (d dsnFlags) Set(value string) error {
 		value := string(part[2:])
 		switch key {
 		case "D":
-			dsn.Database = value
+			cfg.DBName = value
 		case "h":
-			dsn.Host = value
-		case "p":
-			dsn.Password = value
-		case "P":
-			port, err := strconv.ParseInt(value, 10, 64)
-			if err != nil {
-				dsn.Port = int(port)
+			cfg.Addr = value
+			if value == "localhost" {
+				cfg.Net = "unix"
+			} else {
+				cfg.Net = "tcp"
 			}
-		case "t":
-			dsn.Table = value
+		case "p":
+			cfg.Passwd = value
+		case "P":
+			_, err := strconv.ParseInt(value, 10, 64)
+			if err == nil {
+				cfg.Addr += ":" + value
+			}
 		case "u":
-			dsn.User = value
+			cfg.User = value
 		}
 	}
 
-	if dsn.Host == "localhost" {
-		dsn.protocol = "unix"
-	} else {
-		dsn.protocol = "tcp"
-	}
-	d = append(d, dsn)
-	return nil
-}
-
-func (d dsnFlags) Type() string {
-	return "dsn"
+	return cfg.FormatDSN()
 }
 
 func main() {
@@ -255,12 +249,12 @@ func compare(configs []configReader) map[string][]interface{} {
 
 func normalizeValue(str interface{}) interface{} {
 	normalizers := normalizers{
-		&sizesNormalizer{},
-		&numbersNormalizer{},
-		&setsNormalizer{},
+		sizesNormalizer,
+		numbersNormalizer,
+		setsNormalizer,
 	}
 	for _, n := range normalizers {
-		str = n.Normalize(str)
+		str = n(str)
 	}
 
 	return str
@@ -278,7 +272,7 @@ func processParams(arguments []string) (*options, error) {
 
 	fs := flag.NewFlagSet("default", flag.ContinueOnError)
 	fs.StringArrayVarP(&opts.CNFs, "cnf", "c", nil, "cnf file name")
-	fs.VarP(opts.DSNs, "dsn", "d", "full db dsn. Example: user:pass@tcp(127.1:3306)")
+	fs.VarP(&opts.DSNs, "dsn", "d", "full db dsn. Example: user:pass@tcp(127.1:3306)")
 	fs.StringVarP(&opts.OutputFmt, "output", "o", "plain", "Output formatting. Could be json, prettyJson or plain.")
 
 	err := fs.Parse(arguments)
@@ -343,7 +337,7 @@ func getMySQLs(dsns dsnFlags, dbConnector func(string) (*sql.DB, error)) ([]conf
 	var configs []configReader
 
 	for _, dsn := range dsns {
-		db, err := dbConnector(dsn))
+		db, err := dbConnector(dsn)
 		if err != nil {
 			return nil, fmt.Errorf("Cannot connect to the db %s", err.Error())
 		}
